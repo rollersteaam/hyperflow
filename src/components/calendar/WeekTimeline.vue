@@ -60,7 +60,7 @@ async function loadEvents() {
   }
 }
 
-watch(() => [auth.isSignedIn, weekStart.value.getTime()], loadEvents)
+watch(() => [auth.isSignedIn, auth.calendarId, weekStart.value.getTime()], loadEvents)
 onMounted(loadEvents)
 
 function goToPreviousWeek() {
