@@ -256,7 +256,11 @@ async function handleCreate(name: string) {
 
 <template>
   <section class="timeline">
-    <div v-if="!auth.isSignedIn" class="signed-out">
+    <div v-if="auth.isRestoring" class="signed-out">
+      <p>Reconnecting to Google Calendar…</p>
+    </div>
+
+    <div v-else-if="!auth.isSignedIn" class="signed-out">
       <p>Connect your Google Calendar to get started.</p>
       <button type="button" :disabled="auth.isSigningIn" @click="auth.signIn()">
         {{ auth.isSigningIn ? 'Connecting…' : 'Connect Google Calendar' }}

@@ -34,12 +34,7 @@ export interface GoogleAccessToken {
   expiresAt: number
 }
 
-/**
- * Requests a Calendar-scoped access token via the GIS token client.
- * Resolves with an access token the caller can attach to Calendar API
- * requests as `Authorization: Bearer <token>`.
- */
-export async function requestCalendarAccessToken(): Promise<GoogleAccessToken> {
+async function requestAccessToken(overrideConfig: { prompt?: string }): Promise<GoogleAccessToken> {
   const clientId = import.meta.env.VITE_GOOGLE_CLIENT_ID
   if (!clientId) {
     throw new Error(
@@ -73,8 +68,29 @@ export async function requestCalendarAccessToken(): Promise<GoogleAccessToken> {
       },
     })
 
-    tokenClient.requestAccessToken()
+    tokenClient.requestAccessToken(overrideConfig)
   })
+}
+
+/**
+ * Requests a Calendar-scoped access token via the GIS token client.
+ * Resolves with an access token the caller can attach to Calendar API
+ * requests as `Authorization: Bearer <token>`. Prompts the user through
+ * the full Google OAuth consent flow.
+ */
+export function requestCalendarAccessToken(): Promise<GoogleAccessToken> {
+  return requestAccessToken({})
+}
+
+/**
+ * Attempts to obtain a fresh Calendar-scoped access token without showing
+ * any Google UI, relying on the user's existing Google session. Used to
+ * silently restore a previous login on app startup. Rejects if a silent
+ * token can't be obtained (e.g. the Google session has expired or consent
+ * was revoked) — callers should fall back to `requestCalendarAccessToken`.
+ */
+export function requestCalendarAccessTokenSilently(): Promise<GoogleAccessToken> {
+  return requestAccessToken({ prompt: 'none' })
 }
 
 export function revokeAccessToken(accessToken: string): Promise<void> {
