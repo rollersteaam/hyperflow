@@ -1,9 +1,11 @@
 import { defineStore } from 'pinia'
 import { requestCalendarAccessToken, revokeAccessToken } from '@/services/googleAuth'
+import { ensureHyperflowCalendar } from '@/services/googleCalendar'
 
 interface AuthState {
   accessToken: string | null
   expiresAt: number | null
+  calendarId: string | null
   isSigningIn: boolean
   error: string | null
 }
@@ -12,6 +14,7 @@ export const useAuthStore = defineStore('auth', {
   state: (): AuthState => ({
     accessToken: null,
     expiresAt: null,
+    calendarId: null,
     isSigningIn: false,
     error: null,
   }),
@@ -30,8 +33,12 @@ export const useAuthStore = defineStore('auth', {
         const { accessToken, expiresAt } = await requestCalendarAccessToken()
         this.accessToken = accessToken
         this.expiresAt = expiresAt
+        this.calendarId = await ensureHyperflowCalendar(accessToken)
       } catch (err) {
         this.error = err instanceof Error ? err.message : 'Failed to sign in with Google'
+        this.accessToken = null
+        this.expiresAt = null
+        this.calendarId = null
       } finally {
         this.isSigningIn = false
       }
@@ -43,6 +50,7 @@ export const useAuthStore = defineStore('auth', {
       }
       this.accessToken = null
       this.expiresAt = null
+      this.calendarId = null
     },
   },
 })

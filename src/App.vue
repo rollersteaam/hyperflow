@@ -15,7 +15,7 @@ import { RouterView } from 'vue-router'
 
 <style scoped>
 .app-shell {
-  min-height: 100vh;
+  height: 100vh;
   display: flex;
   flex-direction: column;
 }
@@ -32,6 +32,9 @@ import { RouterView } from 'vue-router'
 
 main {
   flex: 1;
+  min-height: 0;
   padding: 1.5rem;
+  display: flex;
+  flex-direction: column;
 }
 </style>
