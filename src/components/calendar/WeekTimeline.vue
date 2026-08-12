@@ -1,8 +1,10 @@
 <script setup lang="ts">
 import { ref, computed, watch, onMounted } from 'vue'
 import { useAuthStore } from '@/stores/auth'
-import { listEvents, createEvent, updateEvent, type CalendarEvent } from '@/services/googleCalendar'
+import { listEvents, createEvent, updateEvent, deleteEvent, type CalendarEvent } from '@/services/googleCalendar'
 import CreateEventPopover from './CreateEventPopover.vue'
+import EventActionMenu from './EventActionMenu.vue'
+import EditEventModal from './EditEventModal.vue'
 import {
   MINUTES_PER_DAY,
   SNAP_MINUTES,
@@ -135,12 +137,17 @@ function onDragMove(e: PointerEvent) {
   state.deltaMinutes = snapToQuarterHour(dy / MINUTE_HEIGHT)
 }
 
-async function onDragEnd() {
+async function onDragEnd(e: PointerEvent) {
   window.removeEventListener('pointermove', onDragMove)
   window.removeEventListener('pointerup', onDragEnd)
   const state = dragState.value
   dragState.value = null
-  if (!state || !state.moved) return
+  if (!state) return
+
+  if (!state.moved) {
+    openActionMenu(state.eventId, e.clientX, e.clientY)
+    return
+  }
 
   const event = events.value.find((ev) => ev.id === state.eventId)
   if (!event || !auth.accessToken || !auth.calendarId) return
@@ -208,6 +215,66 @@ const positionedEvents = computed(() => {
     })
     .filter((v): v is NonNullable<typeof v> => v !== null)
 })
+
+// --- Event action menu (edit / delete) ---
+
+interface ActionMenuState {
+  x: number
+  y: number
+  event: CalendarEvent
+}
+
+const actionMenu = ref<ActionMenuState | null>(null)
+const editModalEvent = ref<CalendarEvent | null>(null)
+
+function openActionMenu(eventId: string, x: number, y: number) {
+  const event = events.value.find((ev) => ev.id === eventId)
+  if (!event) return
+  actionMenu.value = { x, y, event }
+}
+
+function handleEditRequest() {
+  const menu = actionMenu.value
+  actionMenu.value = null
+  if (!menu) return
+  editModalEvent.value = menu.event
+}
+
+async function handleDeleteRequest() {
+  const menu = actionMenu.value
+  actionMenu.value = null
+  if (!menu || !auth.accessToken || !auth.calendarId) return
+
+  const eventId = menu.event.id
+  const previousEvents = events.value
+  events.value = events.value.filter((ev) => ev.id !== eventId)
+
+  try {
+    await deleteEvent(auth.accessToken, auth.calendarId, eventId)
+  } catch (err) {
+    events.value = previousEvents
+    loadError.value = err instanceof Error ? err.message : 'Failed to delete event'
+  }
+}
+
+async function handleEditSubmit(name: string) {
+  const target = editModalEvent.value
+  editModalEvent.value = null
+  if (!target || !auth.accessToken || !auth.calendarId) return
+
+  const event = events.value.find((ev) => ev.id === target.id)
+  if (!event) return
+
+  const previousSummary = event.summary
+  event.summary = name
+
+  try {
+    await updateEvent(auth.accessToken, auth.calendarId, event.id, { summary: name })
+  } catch (err) {
+    event.summary = previousSummary
+    loadError.value = err instanceof Error ? err.message : 'Failed to update event'
+  }
+}
 
 // --- Click-to-create ---
 
@@ -335,6 +402,22 @@ async function handleCreate(name: string) {
         :y="popover.y"
         @submit="handleCreate"
         @cancel="popover = null"
+      />
+
+      <EventActionMenu
+        v-if="actionMenu"
+        :x="actionMenu.x"
+        :y="actionMenu.y"
+        @edit="handleEditRequest"
+        @delete="handleDeleteRequest"
+        @cancel="actionMenu = null"
+      />
+
+      <EditEventModal
+        v-if="editModalEvent"
+        :initial-name="editModalEvent.summary ?? ''"
+        @submit="handleEditSubmit"
+        @cancel="editModalEvent = null"
       />
     </template>
   </section>
