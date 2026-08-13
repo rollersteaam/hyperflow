@@ -189,6 +189,7 @@ const positionedEvents = computed(() => {
 
       const durationMinutes = Math.max((end.getTime() - start.getTime()) / 60000, SNAP_MINUTES)
       const dragging = dragState.value?.moved && dragState.value.eventId === event.id
+      const resizing = resizeState.value?.resizing && resizeState.value.eventId === event.id
 
       const dayIndex = dragging
         ? clamp(homeDayIndex + dragState.value!.deltaDayIndex, 0, DAYS_PER_WEEK - 1)
@@ -200,21 +201,98 @@ const positionedEvents = computed(() => {
             MINUTES_PER_DAY - durationMinutes,
           )
         : minutesSinceMidnight(start)
+      const effectiveDuration = resizing
+        ? durationMinutes + resizeState.value!.deltaMinutes
+        : durationMinutes
 
       return {
         event,
         dayIndex,
         dragging: Boolean(dragging),
+        resizing: Boolean(resizing),
         style: {
           left: `${dayIndex * COLUMN_PERCENT}%`,
           width: `${COLUMN_PERCENT}%`,
           top: `${startMinutes * MINUTE_HEIGHT}px`,
-          height: `${durationMinutes * MINUTE_HEIGHT}px`,
+          height: `${effectiveDuration * MINUTE_HEIGHT}px`,
         },
       }
     })
     .filter((v): v is NonNullable<typeof v> => v !== null)
 })
+
+// --- Drag-to-resize state ---
+
+interface ResizeState {
+  eventId: string
+  originDurationMinutes: number
+  startMinutes: number
+  startClientY: number
+  deltaMinutes: number
+  resizing: boolean
+}
+
+const resizeState = ref<ResizeState | null>(null)
+
+function onResizePointerDown(e: PointerEvent, event: CalendarEvent) {
+  if (!event.start.dateTime || !event.end.dateTime) return
+  e.preventDefault()
+  const start = new Date(event.start.dateTime)
+  const end = new Date(event.end.dateTime)
+  resizeState.value = {
+    eventId: event.id,
+    originDurationMinutes: (end.getTime() - start.getTime()) / 60000,
+    startMinutes: minutesSinceMidnight(start),
+    startClientY: e.clientY,
+    deltaMinutes: 0,
+    resizing: false,
+  }
+  window.addEventListener('pointermove', onResizeMove)
+  window.addEventListener('pointerup', onResizeEnd)
+}
+
+function onResizeMove(e: PointerEvent) {
+  const state = resizeState.value
+  if (!state) return
+  const dy = e.clientY - state.startClientY
+  if (!state.resizing && Math.abs(dy) > DRAG_THRESHOLD_PX) {
+    state.resizing = true
+  }
+  if (!state.resizing) return
+
+  state.deltaMinutes = clamp(
+    snapToQuarterHour(dy / MINUTE_HEIGHT),
+    SNAP_MINUTES - state.originDurationMinutes,
+    MINUTES_PER_DAY - state.startMinutes - state.originDurationMinutes,
+  )
+}
+
+async function onResizeEnd() {
+  window.removeEventListener('pointermove', onResizeMove)
+  window.removeEventListener('pointerup', onResizeEnd)
+  const state = resizeState.value
+  resizeState.value = null
+  if (!state || !state.resizing) return
+
+  const event = events.value.find((ev) => ev.id === state.eventId)
+  if (!event || !event.start.dateTime || !auth.accessToken || !auth.calendarId) return
+
+  const newDurationMinutes = state.originDurationMinutes + state.deltaMinutes
+  const start = new Date(event.start.dateTime)
+  const newEnd = new Date(start.getTime() + newDurationMinutes * 60000)
+
+  const previousEnd = event.end
+  event.end = { dateTime: newEnd.toISOString() }
+
+  try {
+    await updateEvent(auth.accessToken, auth.calendarId, event.id, {
+      end: { dateTime: newEnd.toISOString() },
+    })
+  } catch (err) {
+    event.end = previousEnd
+    loadError.value = err instanceof Error ? err.message : 'Failed to resize event'
+  }
+}
 
 // --- Event action menu (edit / delete) ---
 
@@ -387,11 +465,12 @@ async function handleCreate(name: string) {
             v-for="pe in positionedEvents"
             :key="pe.event.id"
             class="event-block"
-            :class="{ dragging: pe.dragging }"
+            :class="{ dragging: pe.dragging, resizing: pe.resizing }"
             :style="pe.style"
             @pointerdown.stop="onEventPointerDown($event, pe.event, pe.dayIndex)"
           >
             <span class="event-title">{{ pe.event.summary || '(untitled)' }}</span>
+            <div class="resize-handle" @pointerdown.stop="onResizePointerDown($event, pe.event)" />
           </div>
         </div>
       </div>
@@ -562,10 +641,24 @@ async function handleCreate(name: string) {
   cursor: grabbing;
 }
 
+.event-block.resizing {
+  z-index: 2;
+}
+
 .event-title {
   display: block;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+
+.resize-handle {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 6px;
+  cursor: ns-resize;
+  touch-action: none;
 }
 </style>
