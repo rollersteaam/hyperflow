@@ -14,7 +14,7 @@ import {
   isEventPlaying,
   isBreakEvent,
   buildBreakDescription,
-} from '@/utils/eventTracking'
+} from '@/utils/calenderTracking.ts'
 import { computeShovelSchedule, type ShovelEvent, type BusyInterval } from '@/utils/shovel'
 import { computeFlowSchedule, type FlowTask } from '@/utils/flow'
 import CreateEventPopover from './CreateEventPopover.vue'
