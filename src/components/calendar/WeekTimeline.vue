@@ -1,7 +1,8 @@
 <script setup lang="ts">
-import { ref, computed, watch, onMounted } from 'vue'
+import { ref, computed, watch, onMounted, onUnmounted } from 'vue'
 import { useAuthStore } from '@/stores/auth'
 import { listEvents, createEvent, updateEvent, deleteEvent, type CalendarEvent } from '@/services/googleCalendar'
+import { parseTracking, buildDescription, isEventPlaying } from '@/utils/eventTracking'
 import CreateEventPopover from './CreateEventPopover.vue'
 import EventActionMenu from './EventActionMenu.vue'
 import EditEventModal from './EditEventModal.vue'
@@ -55,6 +56,7 @@ async function loadEvents() {
       addDays(weekStart.value, DAYS_PER_WEEK).toISOString(),
     )
     events.value = result.items
+    await resumePlayingEvents()
   } catch (err) {
     loadError.value = err instanceof Error ? err.message : 'Failed to load calendar events'
   } finally {
@@ -64,6 +66,9 @@ async function loadEvents() {
 
 watch(() => [auth.isSignedIn, auth.calendarId, weekStart.value.getTime()], loadEvents)
 onMounted(loadEvents)
+onUnmounted(() => {
+  for (const eventId of tickIntervals.keys()) stopTicking(eventId)
+})
 
 function goToPreviousWeek() {
   anchorDate.value = addDays(weekStart.value, -DAYS_PER_WEEK)
@@ -294,7 +299,184 @@ async function onResizeEnd() {
   }
 }
 
-// --- Event action menu (edit / delete) ---
+// --- Play / stop timers ---
+//
+// Playing an event stamps its description with an "Expected time" (the
+// event's scheduled duration at the moment Play was clicked) and moves its
+// start to now. Every minute while playing, its end time is nudged forward
+// by a minute so the block visibly grows. Stopping sets the end to now and
+// records the "Actual time" spent plus the "Slippage" against what was
+// expected. Playing an event that was already played-and-stopped before
+// starts a fresh copy so the original's finished session is preserved, and
+// the copy's Expected/Actual time accumulate on top of the previous session.
+
+const tickIntervals = new Map<string, ReturnType<typeof setInterval>>()
+
+function startTicking(eventId: string) {
+  stopTicking(eventId)
+  const interval = setInterval(async () => {
+    const ev = events.value.find((e) => e.id === eventId)
+    if (!ev || !ev.end.dateTime || !auth.accessToken || !auth.calendarId) {
+      stopTicking(eventId)
+      return
+    }
+    const newEnd = new Date(new Date(ev.end.dateTime).getTime() + 60000)
+    ev.end = { ...ev.end, dateTime: newEnd.toISOString() }
+    try {
+      await updateEvent(auth.accessToken, auth.calendarId, eventId, { end: ev.end })
+    } catch (err) {
+      loadError.value = err instanceof Error ? err.message : 'Failed to update event timer'
+    }
+  }, 60000)
+  tickIntervals.set(eventId, interval)
+}
+
+function stopTicking(eventId: string) {
+  const interval = tickIntervals.get(eventId)
+  if (interval) {
+    clearInterval(interval)
+    tickIntervals.delete(eventId)
+  }
+}
+
+/** Resumes ticking (and catches up the end time) for any event still mid-play after a page reload. */
+async function resumePlayingEvents() {
+  if (!auth.accessToken || !auth.calendarId) return
+  const accessToken = auth.accessToken
+  const calendarId = auth.calendarId
+
+  for (const event of events.value) {
+    if (tickIntervals.has(event.id)) continue
+    if (!event.start.dateTime || !event.end.dateTime) continue
+    if (!isEventPlaying(event.description)) continue
+
+    const now = new Date()
+    if (new Date(event.end.dateTime).getTime() < now.getTime()) {
+      const previousEnd = event.end
+      event.end = { dateTime: now.toISOString(), timeZone: event.end.timeZone }
+      try {
+        await updateEvent(accessToken, calendarId, event.id, { end: event.end })
+      } catch {
+        event.end = previousEnd
+      }
+    }
+    startTicking(event.id)
+  }
+}
+
+async function handlePlayRequest() {
+  const menu = actionMenu.value
+  actionMenu.value = null
+  if (!menu || !auth.accessToken || !auth.calendarId) return
+  const accessToken = auth.accessToken
+  const calendarId = auth.calendarId
+
+  const source = events.value.find((ev) => ev.id === menu.event.id)
+  if (!source || !source.start.dateTime || !source.end.dateTime) return
+
+  const { prefix, tracking } = parseTracking(source.description)
+  const durationMin = Math.round(
+    (new Date(source.end.dateTime).getTime() - new Date(source.start.dateTime).getTime()) / 60000,
+  )
+
+  let target = source
+  let baseExpected = 0
+  let baseActual = 0
+
+  if (tracking.actualMin != null) {
+    // Already played to completion before — start a fresh copy that
+    // accumulates on top of the previous session(s), leaving the original
+    // event's finished record untouched.
+    baseExpected = tracking.expectedMin ?? 0
+    baseActual = tracking.actualMin
+
+    try {
+      const copy = await createEvent(accessToken, calendarId, {
+        summary: source.summary,
+        description: prefix || undefined,
+        start: source.start,
+        end: source.end,
+      })
+      events.value.push(copy)
+      target = copy
+    } catch (err) {
+      loadError.value = err instanceof Error ? err.message : 'Failed to start a new tracking session'
+      return
+    }
+  }
+
+  const now = new Date()
+  const newDescription = buildDescription(prefix, {
+    expectedMin: baseExpected + durationMin,
+    carriedActualMin: baseActual || undefined,
+  })
+
+  const previousStart = target.start
+  const previousEnd = target.end
+  const previousDescription = target.description
+  target.start = { dateTime: now.toISOString(), timeZone: target.start.timeZone }
+  target.end = { dateTime: now.toISOString(), timeZone: target.end.timeZone }
+  target.description = newDescription
+
+  try {
+    await updateEvent(accessToken, calendarId, target.id, {
+      start: target.start,
+      end: target.end,
+      description: newDescription,
+    })
+    startTicking(target.id)
+  } catch (err) {
+    target.start = previousStart
+    target.end = previousEnd
+    target.description = previousDescription
+    loadError.value = err instanceof Error ? err.message : 'Failed to start event timer'
+  }
+}
+
+async function handleStopRequest() {
+  const menu = actionMenu.value
+  actionMenu.value = null
+  if (!menu || !auth.accessToken || !auth.calendarId) return
+  const accessToken = auth.accessToken
+  const calendarId = auth.calendarId
+
+  const event = events.value.find((ev) => ev.id === menu.event.id)
+  if (!event || !event.start.dateTime) return
+
+  stopTicking(event.id)
+
+  const { prefix, tracking } = parseTracking(event.description)
+  const now = new Date()
+  const sessionMin = Math.round((now.getTime() - new Date(event.start.dateTime).getTime()) / 60000)
+  const expected = tracking.expectedMin ?? 0
+  const actual = (tracking.carriedActualMin ?? 0) + sessionMin
+  const slippage = actual - expected
+
+  const newDescription = buildDescription(prefix, {
+    expectedMin: expected,
+    actualMin: actual,
+    slippageMin: slippage,
+  })
+
+  const previousEnd = event.end
+  const previousDescription = event.description
+  event.end = { dateTime: now.toISOString(), timeZone: event.end.timeZone }
+  event.description = newDescription
+
+  try {
+    await updateEvent(accessToken, calendarId, event.id, {
+      end: event.end,
+      description: newDescription,
+    })
+  } catch (err) {
+    event.end = previousEnd
+    event.description = previousDescription
+    loadError.value = err instanceof Error ? err.message : 'Failed to stop event timer'
+    startTicking(event.id)
+  }
+}
+
+// --- Event action menu (play / stop / edit / delete) ---
 
 interface ActionMenuState {
   x: number
@@ -487,6 +669,9 @@ async function handleCreate(name: string) {
         v-if="actionMenu"
         :x="actionMenu.x"
         :y="actionMenu.y"
+        :is-playing="isEventPlaying(actionMenu.event.description)"
+        @play="handlePlayRequest"
+        @stop="handleStopRequest"
         @edit="handleEditRequest"
         @delete="handleDeleteRequest"
         @cancel="actionMenu = null"

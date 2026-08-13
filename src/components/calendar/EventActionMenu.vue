@@ -2,11 +2,14 @@
 defineProps<{
   x: number
   y: number
+  isPlaying: boolean
 }>()
 
 const emit = defineEmits<{
   edit: []
   delete: []
+  play: []
+  stop: []
   cancel: []
 }>()
 </script>
@@ -19,6 +22,13 @@ const emit = defineEmits<{
       @click.stop
       @keydown.escape="emit('cancel')"
     >
+      <button
+        type="button"
+        class="menu-item"
+        @click="isPlaying ? emit('stop') : emit('play')"
+      >
+        {{ isPlaying ? 'Stop' : 'Play' }}
+      </button>
       <button type="button" class="menu-item" @click="emit('edit')">Edit</button>
       <button type="button" class="menu-item danger" @click="emit('delete')">Delete</button>
     </div>
