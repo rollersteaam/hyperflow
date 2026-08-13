@@ -21,7 +21,7 @@ interface ListEventsResult {
   nextPageToken?: string
 }
 
-interface CalendarListEntry {
+export interface CalendarListEntry {
   id: string
   summary: string
 }
@@ -56,13 +56,20 @@ async function calendarFetch<T>(
   return response.json() as Promise<T>
 }
 
+/** Lists every calendar (Hyperflow's own plus all of the user's other calendars) on the account. */
+export function listCalendars(accessToken: string): Promise<CalendarListEntry[]> {
+  return calendarFetch<CalendarListResult>(accessToken, '/users/me/calendarList').then(
+    (result) => result.items ?? [],
+  )
+}
+
 /**
  * Finds the user's dedicated "Hyperflow" calendar, creating it if it doesn't
  * exist yet. Hyperflow never reads or writes the user's primary calendar.
  */
 export async function ensureHyperflowCalendar(accessToken: string): Promise<string> {
-  const list = await calendarFetch<CalendarListResult>(accessToken, '/users/me/calendarList')
-  const existing = list.items?.find((entry) => entry.summary === HYPERFLOW_CALENDAR_NAME)
+  const calendars = await listCalendars(accessToken)
+  const existing = calendars.find((entry) => entry.summary === HYPERFLOW_CALENDAR_NAME)
   if (existing) return existing.id
 
   const created = await calendarFetch<{ id: string }>(accessToken, '/calendars', {
@@ -72,19 +79,22 @@ export async function ensureHyperflowCalendar(accessToken: string): Promise<stri
   return created.id
 }
 
-/** Lists events on the given calendar within a time range (used for a week's worth of the timeline). */
+/**
+ * Lists events on the given calendar within a time range (used for a week's
+ * worth of the timeline). `timeMax` is optional for open-ended future queries.
+ */
 export function listEvents(
   accessToken: string,
   calendarId: string,
   timeMin: string,
-  timeMax: string,
+  timeMax?: string,
 ): Promise<ListEventsResult> {
   const params = new URLSearchParams({
     timeMin,
-    timeMax,
     singleEvents: 'true',
     orderBy: 'startTime',
   })
+  if (timeMax) params.set('timeMax', timeMax)
   return calendarFetch<ListEventsResult>(
     accessToken,
     `/calendars/${encodeURIComponent(calendarId)}/events?${params}`,

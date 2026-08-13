@@ -5,6 +5,13 @@ export const MINUTES_PER_DAY = 24 * 60
 export const SNAP_MINUTES = 15
 export const DAYS_PER_WEEK = 7
 
+/** Returns local midnight on the day of `date`. */
+export function startOfDay(date: Date): Date {
+  const result = new Date(date)
+  result.setHours(0, 0, 0, 0)
+  return result
+}
+
 /** Returns midnight on the Monday of the week containing `date`. */
 export function startOfWeek(date: Date): Date {
   const result = new Date(date)

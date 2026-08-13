@@ -1,8 +1,16 @@
 <script setup lang="ts">
 import { ref, computed, watch, onMounted, onUnmounted } from 'vue'
 import { useAuthStore } from '@/stores/auth'
-import { listEvents, createEvent, updateEvent, deleteEvent, type CalendarEvent } from '@/services/googleCalendar'
+import {
+  listEvents,
+  listCalendars,
+  createEvent,
+  updateEvent,
+  deleteEvent,
+  type CalendarEvent,
+} from '@/services/googleCalendar'
 import { parseTracking, buildDescription, isEventPlaying } from '@/utils/eventTracking'
+import { computeShovelSchedule, type ShovelEvent, type BusyInterval } from '@/utils/shovel'
 import CreateEventPopover from './CreateEventPopover.vue'
 import EventActionMenu from './EventActionMenu.vue'
 import EditEventModal from './EditEventModal.vue'
@@ -10,6 +18,7 @@ import {
   MINUTES_PER_DAY,
   SNAP_MINUTES,
   DAYS_PER_WEEK,
+  startOfDay,
   startOfWeek,
   addDays,
   isSameDay,
@@ -536,6 +545,86 @@ async function handleEditSubmit(name: string) {
   }
 }
 
+// --- Shovel ---
+//
+// Moves every event scheduled for today that has never been started (no
+// "Expected time" stamp, see eventTracking.ts) to line up back-to-back
+// starting now, in their original relative order. Events on other days are
+// left untouched. Already-started/finished Hyperflow events, not-today
+// Hyperflow events, and every event on the user's other calendars are all
+// treated as fixed busy time: a shoveled event that would land on top of one
+// is pushed to start right after it, which cascades onto every event still
+// queued behind it. The busy window looks a few days past today in case that
+// cascade pushes an event past midnight.
+
+const SHOVEL_BUSY_LOOKAHEAD_DAYS = 3
+
+const isShoveling = ref(false)
+
+async function handleShovel() {
+  if (!auth.accessToken || !auth.calendarId || isShoveling.value) return
+  const accessToken = auth.accessToken
+  const calendarId = auth.calendarId
+
+  isShoveling.value = true
+  loadError.value = null
+  try {
+    const now = new Date()
+    const todayStart = startOfDay(now)
+    const windowStart = todayStart.toISOString()
+    const windowEnd = addDays(todayStart, 1 + SHOVEL_BUSY_LOOKAHEAD_DAYS).toISOString()
+
+    const hyperflowItems = (await listEvents(accessToken, calendarId, windowStart, windowEnd)).items
+
+    const eligible: ShovelEvent[] = []
+    const busy: BusyInterval[] = []
+    for (const ev of hyperflowItems) {
+      if (!ev.start.dateTime || !ev.end.dateTime) continue
+      const interval = { start: new Date(ev.start.dateTime), end: new Date(ev.end.dateTime) }
+      const neverStarted = parseTracking(ev.description).tracking.expectedMin == null
+      if (neverStarted && isSameDay(interval.start, now)) {
+        eligible.push({ id: ev.id, ...interval })
+      } else {
+        busy.push(interval)
+      }
+    }
+
+    const calendars = await listCalendars(accessToken)
+    const otherCalendarIds = calendars.map((cal) => cal.id).filter((id) => id !== calendarId)
+    const otherEventLists = await Promise.all(
+      otherCalendarIds.map((id) =>
+        listEvents(accessToken, id, windowStart, windowEnd).catch(
+          () => ({ items: [] as CalendarEvent[] }),
+        ),
+      ),
+    )
+    for (const result of otherEventLists) {
+      for (const ev of result.items) {
+        if (!ev.start.dateTime || !ev.end.dateTime) continue
+        busy.push({ start: new Date(ev.start.dateTime), end: new Date(ev.end.dateTime) })
+      }
+    }
+
+    const schedule = computeShovelSchedule(eligible, busy, now)
+    const originalById = new Map(eligible.map((ev) => [ev.id, ev]))
+
+    for (const item of schedule) {
+      const original = originalById.get(item.id)
+      if (!original || item.start.getTime() === original.start.getTime()) continue
+      await updateEvent(accessToken, calendarId, item.id, {
+        start: { dateTime: item.start.toISOString() },
+        end: { dateTime: item.end.toISOString() },
+      })
+    }
+
+    await loadEvents()
+  } catch (err) {
+    loadError.value = err instanceof Error ? err.message : 'Failed to shovel events'
+  } finally {
+    isShoveling.value = false
+  }
+}
+
 // --- Click-to-create ---
 
 interface PopoverState {
@@ -603,8 +692,20 @@ async function handleCreate(name: string) {
           <button type="button" class="secondary" @click="goToNextWeek">›</button>
           <span class="week-label">{{ formatWeekRange(weekStart) }}</span>
         </div>
-        <span v-if="isLoading" class="status">Loading…</span>
-        <span v-else-if="loadError" class="status error">{{ loadError }}</span>
+        <div class="toolbar-actions">
+          <span v-if="isLoading" class="status">Loading…</span>
+          <span v-else-if="isShoveling" class="status">Shoveling…</span>
+          <span v-else-if="loadError" class="status error">{{ loadError }}</span>
+          <button
+            type="button"
+            class="secondary"
+            :disabled="isShoveling"
+            title="Line up today's never-started events back-to-back starting now"
+            @click="handleShovel"
+          >
+            Shovel
+          </button>
+        </div>
       </div>
 
       <div class="grid-header">
@@ -718,6 +819,16 @@ async function handleCreate(name: string) {
 }
 
 .nav button {
+  padding: 0.3rem 0.6rem;
+}
+
+.toolbar-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+}
+
+.toolbar-actions button {
   padding: 0.3rem 0.6rem;
 }
 
