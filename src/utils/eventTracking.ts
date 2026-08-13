@@ -61,3 +61,16 @@ export function isEventPlaying(description?: string): boolean {
   const { tracking } = parseTracking(description)
   return tracking.expectedMin != null && tracking.actualMin == null
 }
+
+/** Marker line stamped on the description of a Flow-created break event. */
+const BREAK_MARKER = 'Hyperflow break'
+
+/** Description for a Flow-created break event. */
+export function buildBreakDescription(): string {
+  return BREAK_MARKER
+}
+
+/** True for a Flow-created break — these are never treated as a task by Shovel or Flow. */
+export function isBreakEvent(description?: string): boolean {
+  return (description ?? '').split('\n').some((line) => line.trim() === BREAK_MARKER)
+}

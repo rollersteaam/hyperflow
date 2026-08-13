@@ -3,14 +3,20 @@ import { ref, computed, watch, onMounted, onUnmounted } from 'vue'
 import { useAuthStore } from '@/stores/auth'
 import {
   listEvents,
-  listCalendars,
   createEvent,
   updateEvent,
   deleteEvent,
   type CalendarEvent,
 } from '@/services/googleCalendar'
-import { parseTracking, buildDescription, isEventPlaying } from '@/utils/eventTracking'
+import {
+  parseTracking,
+  buildDescription,
+  isEventPlaying,
+  isBreakEvent,
+  buildBreakDescription,
+} from '@/utils/eventTracking'
 import { computeShovelSchedule, type ShovelEvent, type BusyInterval } from '@/utils/shovel'
+import { computeFlowSchedule, type FlowTask } from '@/utils/flow'
 import CreateEventPopover from './CreateEventPopover.vue'
 import EventActionMenu from './EventActionMenu.vue'
 import EditEventModal from './EditEventModal.vue'
@@ -550,12 +556,11 @@ async function handleEditSubmit(name: string) {
 // Moves every event scheduled for today that has never been started (no
 // "Expected time" stamp, see eventTracking.ts) to line up back-to-back
 // starting now, in their original relative order. Events on other days are
-// left untouched. Already-started/finished Hyperflow events, not-today
-// Hyperflow events, and every event on the user's other calendars are all
-// treated as fixed busy time: a shoveled event that would land on top of one
-// is pushed to start right after it, which cascades onto every event still
-// queued behind it. The busy window looks a few days past today in case that
-// cascade pushes an event past midnight.
+// left untouched. Already-started/finished Hyperflow events and not-today
+// Hyperflow events are treated as fixed busy time: a shoveled event that
+// would land on top of one is pushed to start right after it, which
+// cascades onto every event still queued behind it. The busy window looks a
+// few days past today in case that cascade pushes an event past midnight.
 
 const SHOVEL_BUSY_LOOKAHEAD_DAYS = 3
 
@@ -582,26 +587,10 @@ async function handleShovel() {
       if (!ev.start.dateTime || !ev.end.dateTime) continue
       const interval = { start: new Date(ev.start.dateTime), end: new Date(ev.end.dateTime) }
       const neverStarted = parseTracking(ev.description).tracking.expectedMin == null
-      if (neverStarted && isSameDay(interval.start, now)) {
+      if (neverStarted && isSameDay(interval.start, now) && !isBreakEvent(ev.description)) {
         eligible.push({ id: ev.id, ...interval })
       } else {
         busy.push(interval)
-      }
-    }
-
-    const calendars = await listCalendars(accessToken)
-    const otherCalendarIds = calendars.map((cal) => cal.id).filter((id) => id !== calendarId)
-    const otherEventLists = await Promise.all(
-      otherCalendarIds.map((id) =>
-        listEvents(accessToken, id, windowStart, windowEnd).catch(
-          () => ({ items: [] as CalendarEvent[] }),
-        ),
-      ),
-    )
-    for (const result of otherEventLists) {
-      for (const ev of result.items) {
-        if (!ev.start.dateTime || !ev.end.dateTime) continue
-        busy.push({ start: new Date(ev.start.dateTime), end: new Date(ev.end.dateTime) })
       }
     }
 
@@ -622,6 +611,70 @@ async function handleShovel() {
     loadError.value = err instanceof Error ? err.message : 'Failed to shovel events'
   } finally {
     isShoveling.value = false
+  }
+}
+
+// --- Flow ---
+//
+// Caps today's remaining (never-started) tasks at 90-minute back-to-back
+// blocks, inserting a 15-minute break event right after whichever task would
+// otherwise push a block over that cap. Breaks are plain Hyperflow events
+// stamped with a marker (see eventTracking.ts) so Shovel and Flow both know
+// to leave them exactly where they land — never scheduling over them, never
+// moving them.
+
+const isFlowing = ref(false)
+
+async function handleFlow() {
+  if (!auth.accessToken || !auth.calendarId || isFlowing.value) return
+  const accessToken = auth.accessToken
+  const calendarId = auth.calendarId
+
+  isFlowing.value = true
+  loadError.value = null
+  try {
+    const now = new Date()
+    const todayStart = startOfDay(now)
+    const windowStart = todayStart.toISOString()
+    const windowEnd = addDays(todayStart, 1).toISOString()
+
+    const todaysItems = (await listEvents(accessToken, calendarId, windowStart, windowEnd)).items
+
+    const tasks: FlowTask[] = []
+    for (const ev of todaysItems) {
+      if (!ev.start.dateTime || !ev.end.dateTime) continue
+      if (isBreakEvent(ev.description)) continue
+      const neverStarted = parseTracking(ev.description).tracking.expectedMin == null
+      if (!neverStarted) continue
+      tasks.push({ id: ev.id, start: new Date(ev.start.dateTime), end: new Date(ev.end.dateTime) })
+    }
+
+    const { taskUpdates, breaksToInsert } = computeFlowSchedule(tasks)
+    const originalById = new Map(tasks.map((task) => [task.id, task]))
+
+    for (const update of taskUpdates) {
+      const original = originalById.get(update.id)
+      if (!original || update.start.getTime() === original.start.getTime()) continue
+      await updateEvent(accessToken, calendarId, update.id, {
+        start: { dateTime: update.start.toISOString() },
+        end: { dateTime: update.end.toISOString() },
+      })
+    }
+
+    for (const brk of breaksToInsert) {
+      await createEvent(accessToken, calendarId, {
+        summary: 'Break',
+        description: buildBreakDescription(),
+        start: { dateTime: brk.start.toISOString() },
+        end: { dateTime: brk.end.toISOString() },
+      })
+    }
+
+    await loadEvents()
+  } catch (err) {
+    loadError.value = err instanceof Error ? err.message : 'Failed to flow events'
+  } finally {
+    isFlowing.value = false
   }
 }
 
@@ -695,6 +748,7 @@ async function handleCreate(name: string) {
         <div class="toolbar-actions">
           <span v-if="isLoading" class="status">Loading…</span>
           <span v-else-if="isShoveling" class="status">Shoveling…</span>
+          <span v-else-if="isFlowing" class="status">Flowing…</span>
           <span v-else-if="loadError" class="status error">{{ loadError }}</span>
           <button
             type="button"
@@ -704,6 +758,15 @@ async function handleCreate(name: string) {
             @click="handleShovel"
           >
             Shovel
+          </button>
+          <button
+            type="button"
+            class="secondary"
+            :disabled="isFlowing"
+            title="Cap today's remaining tasks at 90-minute blocks with 15-minute breaks in between"
+            @click="handleFlow"
+          >
+            👁
           </button>
         </div>
       </div>
